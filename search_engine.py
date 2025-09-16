@@ -204,32 +204,38 @@ class HybridSearchEngine:
             self._build_fresh_index()
     
     def search(self, refined_query: str, k: int = 20) -> List[SearchResult]:
-        """Phase 3: 하이브리드 검색 수행"""
-        # 쿼리 전처리
-        query_tokens = self.text_utils.tokenize(refined_query)
-        
         # 쿼리 임베딩 생성
         query_semantic_emb = self._generate_embeddings([refined_query])[0]
+        query_tokens = self.text_utils.tokenize(refined_query)
         query_token_embs = []
         if query_tokens:
             query_token_embs = self._generate_embeddings(query_tokens)
         
-        # 후보 스코어링
-        candidates = []
+        # 1단계: FAISS로 의미적 유사 후보 추출 (상위 100개)
+        top_candidates = min(100, len(self.token_metadata))
+        scores, indices = self.semantic_index.search(
+            query_semantic_emb.reshape(1, -1).astype('float32'), 
+            top_candidates
+        )
         
-        for term_data in self.token_metadata:
+        # 2단계: FAISS 후보들만 ColBERT 점수 계산
+        candidates = []
+        for i, idx in enumerate(indices[0]):
+            if idx >= len(self.token_metadata):  # 인덱스 범위 체크
+                continue
+                
+            term_data = self.token_metadata[idx]
             term = self.terms[term_data['term_index']]
             
-            # 1) 의미적 점수 계산
-            term_semantic_emb = term_data['semantic_embedding']
-            semantic_score = self._cosine_similarity(query_semantic_emb, term_semantic_emb)
+            # FAISS에서 계산된 의미적 점수 사용 (이미 코사인 유사도)
+            semantic_score = float(scores[0][i])
             
-            # 2) ColBERT 점수 계산
+            # ColBERT 점수 계산
             colbert_score = self._calculate_colbert_score(query_token_embs, term_data['token_embeddings'])
             
-            # 3) 하이브리드 점수 계산
+            # 하이브리드 점수
             final_score = SEMANTIC_WEIGHT * semantic_score + COLBERT_WEIGHT * colbert_score
-
+            
             # 임계값 필터링
             if final_score >= SEARCH_THRESHOLD:
                 matched_tokens = [
@@ -247,14 +253,14 @@ class HybridSearchEngine:
                 )
                 candidates.append(result)
         
-        # 정렬 및 상위 k개 선택
+        # 최종 점수로 정렬
         candidates.sort(key=lambda x: x.final_score, reverse=True)
         
         # 순위 부여
         for rank, candidate in enumerate(candidates[:k], 1):
             candidate.rank = rank
         
-        logger.info(f"하이브리드 검색 완료: {len(candidates[:k])}개 후보")
+        logger.info(f"FAISS 최적화 검색 완료: {len(candidates[:k])}개 결과")
         return candidates[:k]
     
     def _cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
